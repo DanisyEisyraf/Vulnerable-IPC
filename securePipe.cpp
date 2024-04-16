@@ -1,12 +1,18 @@
-#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <accctrl.h> // Include this header for EXPLICIT_ACCESS
+#include <aclapi.h> // Include this header for SetEntriesInAcl
 #include <iostream>
 #include <thread>
 #include <vector>
 #include <sstream>
+#include <mutex>
+#include <sddl.h> // Required for ConvertStringSidToSid
 
 #define PIPE_NAME L"\\\\.\\pipe\\hackthispipe"
 #define BUFFER_SIZE 512
+#define NUM_CLIENT_THREADS 5
+
+std::mutex g_mutex;
 
 void SetConsoleColor(WORD color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
@@ -37,14 +43,59 @@ std::string getDeviceInfo(const std::string& tpNo, const std::string& password) 
     return deviceInfo;
 }
 
-
 void PipeServerThread() {
-    HANDLE hPipe;
-    char buffer[BUFFER_SIZE];
-    DWORD bytesRead;
     while (true) {
-        // Create named pipe
-        hPipe = CreateNamedPipe(
+        // Define security attributes
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.lpSecurityDescriptor = nullptr;
+        sa.bInheritHandle = FALSE;
+
+        // Convert the string representation of the administrators group SID to a binary SID
+        PSID adminSid = nullptr;
+        if (!ConvertStringSidToSid(TEXT("S-1-5-32-544"), &adminSid)) {
+            std::cerr << "Error converting string SID to binary SID." << std::endl;
+            return;
+        }
+
+        // Create an ACL with a single ACE that allows only administrators to connect
+        EXPLICIT_ACCESS ea;
+        ZeroMemory(&ea, sizeof(EXPLICIT_ACCESS));
+        ea.grfAccessPermissions = GENERIC_ALL;
+        ea.grfAccessMode = SET_ACCESS;
+        ea.grfInheritance = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+        ea.Trustee.ptstrName = (LPTSTR)adminSid;
+
+        PACL acl = nullptr;
+        DWORD result = SetEntriesInAcl(1, &ea, nullptr, &acl);
+        if (result != ERROR_SUCCESS) {
+            std::cerr << "Error setting ACE in ACL: " << result << std::endl;
+            LocalFree(adminSid);
+            return;
+        }
+
+        // Create a security descriptor that allows only administrators to connect
+        SECURITY_DESCRIPTOR sd;
+        if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+            std::cerr << "Error initializing security descriptor." << std::endl;
+            LocalFree(adminSid);
+            LocalFree(acl);
+            return;
+        }
+
+        if (!SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE)) {
+            std::cerr << "Error setting security descriptor DACL." << std::endl;
+            LocalFree(adminSid);
+            LocalFree(acl);
+            return;
+        }
+
+        sa.lpSecurityDescriptor = &sd;
+
+        // Create named pipe with the specified security attributes
+        HANDLE hPipe = CreateNamedPipe(
             PIPE_NAME,
             PIPE_ACCESS_OUTBOUND,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -52,11 +103,13 @@ void PipeServerThread() {
             BUFFER_SIZE,
             BUFFER_SIZE,
             0,
-            nullptr
+            &sa
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
             std::cerr << "Error creating named pipe." << std::endl;
+            LocalFree(adminSid);
+            LocalFree(acl);
             return;
         }
 
@@ -65,20 +118,45 @@ void PipeServerThread() {
             CloseHandle(hPipe);
             continue;
         }
-        // Send data to client
-        // Substitute this section with getinfoDevice().
-        std::string dummyID;
-        std::string dummypassword;
-        dummyID = "Enter Dummy ID HERE";
-        dummypassword = "Dummy Password here";
-        std::string deviceInfo = getDeviceInfo(dummyID, dummypassword);
-        WriteFile(hPipe, deviceInfo.c_str(), deviceInfo.length(), &bytesRead, nullptr);
 
+        // Send data to client
+        std::string dummyID = "TP061084";
+        std::string dummypassword = "Danisy123@";
+        std::string deviceInfo = getDeviceInfo(dummyID, dummypassword);
+        DWORD bytesWritten;
+        WriteFile(hPipe, deviceInfo.c_str(), deviceInfo.length(), &bytesWritten, nullptr);
+        std::cout << "\nData sent to client" << std::endl;
         // Close pipe
         FlushFileBuffers(hPipe);
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
+
+        // Free resources
+        LocalFree(adminSid);
+        LocalFree(acl);
     }
+}
+
+void PipeClientThread() {
+    HANDLE hPipe;
+    char buffer[BUFFER_SIZE];
+    DWORD bytesRead;
+
+    hPipe = CreateFile(
+        PIPE_NAME,
+        GENERIC_READ,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        0,
+        nullptr
+    );
+
+
+    
+
+    // Close pipe
+    CloseHandle(hPipe);
 }
 
 int main() {
@@ -108,36 +186,16 @@ int main() {
 
     // Start pipe server thread
     std::thread serverThread(PipeServerThread);
-    // Create multiple client threads
-    std::vector<std::thread> clientThreads;
-    for (int i = 0; i < 5; ++i) {
-        clientThreads.emplace_back([]() {
-            HANDLE hPipe;
-            char buffer[BUFFER_SIZE];
-            DWORD bytesRead;
 
-            hPipe = CreateFile(
-                PIPE_NAME,
-                GENERIC_READ,
-                0,
-                nullptr,
-                OPEN_EXISTING,
-                0,
-                nullptr
-            );
-            if (hPipe == INVALID_HANDLE_VALUE) {
-                std::cerr << "Error connecting to named pipe." << std::endl;
-                return;
-            }
-            // Close pipe
-            CloseHandle(hPipe);
-            });
+    std::vector<std::thread> clientThreads;
+    for (int i = 0; i < NUM_CLIENT_THREADS; ++i) {
+        clientThreads.emplace_back(PipeClientThread);
     }
-    // Join client threads
+
+    serverThread.join();
     for (auto& thread : clientThreads) {
         thread.join();
     }
-    // Join server thread
-    serverThread.join();
+
     return 0;
 }
